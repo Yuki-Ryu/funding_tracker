@@ -16,7 +16,7 @@ COINGECKO_REST = os.getenv("COINGECKO_REST", "https://api.coingecko.com/api/v3")
 
 MARKET_CAP_MIN_USD = float(os.getenv("MARKET_CAP_MIN_USD", "100000000"))  # 100m
 REQ_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
-USER_AGENT = "neg-funding-tracker/0.1.14"
+USER_AGENT = "neg-funding-tracker/0.1.15"
 
 def _iso_from_ms(ms: str) -> str:
     try:
@@ -103,7 +103,8 @@ def coingecko_get_market_data(symbol_id: str) -> Dict:
             return data[0]
         return {}
         
-    except Exception:
+    except Exception as e:
+        print(f"Error getting CoinGecko data for {symbol_id}: {e}")
         return {}
 
 def format_number(num: float) -> str:
@@ -119,21 +120,26 @@ def main():
                        help=f"Minimum market cap in USD (default: {MARKET_CAP_MIN_USD})")
     parser.add_argument("--top", type=int, default=20,
                        help="Number of top negative funding rates to show")
+    parser.add_argument("--skip-market-cap", action="store_true",
+                       help="Skip market cap filtering (show all symbols)")
     args = parser.parse_args()
 
     print(f"UTC {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')} | min_cap={args.min_cap:,.0f} USD | fetching...")
     
     # Get all linear instruments
     instruments = bybit_get_all_linear_instruments()
+    print(f"Found {len(instruments)} linear instruments")
     
     results = []
     
-    for instr in instruments:
+    for i, instr in enumerate(instruments):
         symbol = instr.get("symbol", "")
         base_coin = instr.get("baseCoin", "")
         
         if not symbol.endswith("USDT"):
             continue
+        
+        print(f"Processing {i+1}/{len(instruments)}: {symbol}...")
         
         # Get funding rate
         funding_data = bybit_get_funding_rate(symbol)
@@ -155,13 +161,20 @@ def main():
         turnover24h = float(ticker.get("turnover24h", 0))
         next_funding_time = funding_data.get("fundingRateTimestamp", "")
         
-        # Get market cap from CoinGecko
-        market_data = coingecko_get_market_data(base_coin)
-        market_cap = market_data.get("market_cap", 0)
+        # Initialize market cap
+        market_cap = 0
         
-        # Apply market cap filter
-        if market_cap < args.min_cap:
-            continue
+        # Get market cap from CoinGecko if not skipping
+        if not args.skip_market_cap:
+            market_data = coingecko_get_market_data(base_coin)
+            market_cap = market_data.get("market_cap", 0) or 0
+            
+            # Apply market cap filter (only if we have valid data)
+            if market_cap and market_cap < args.min_cap:
+                continue
+        else:
+            # If skipping market cap check, set a placeholder value
+            market_cap = float('inf')
         
         results.append({
             "symbol": symbol,
@@ -174,7 +187,7 @@ def main():
         })
         
         # Rate limiting
-        time.sleep(0.05)
+        time.sleep(0.1)
     
     # Sort by most negative funding rate
     results.sort(key=lambda x: x["fundingRate"])
@@ -188,12 +201,14 @@ def main():
     
     # Print data
     for r in results:
+        market_cap_display = "N/A" if r['marketCapUSD'] == float('inf') else f"{r['marketCapUSD']:,.0f}"
         print(f"{r['symbol']:<12} {r['base']:<8} "
               f"{r['fundingRate']:<12.6f} "
-              f"{r['marketCapUSD']:<20.6f} "
+              f"{market_cap_display:<20} "
               f"{r['nextFundingTime']:<25} "
               f"{r['markPrice']:<12.6f} "
               f"{r['turnover24h']:<15.6f}")
 
 if __name__ == "__main__":
     main()
+
