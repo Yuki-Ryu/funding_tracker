@@ -7,7 +7,8 @@ import time
 import json
 import argparse
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
+from collections import defaultdict
 
 import requests
 
@@ -16,7 +17,7 @@ COINGECKO_REST = os.getenv("COINGECKO_REST", "https://api.coingecko.com/api/v3")
 
 MARKET_CAP_MIN_USD = float(os.getenv("MARKET_CAP_MIN_USD", "100000000"))  # 100m
 REQ_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
-USER_AGENT = "neg-funding-tracker/0.1.15"
+USER_AGENT = "neg-funding-tracker/0.1.20"
 
 def _iso_from_ms(ms: str) -> str:
     try:
@@ -58,61 +59,115 @@ def bybit_get_all_linear_instruments() -> List[dict]:
         
     return out
 
-def bybit_get_funding_rate(symbol: str) -> Dict:
-    """Get current funding rate for a symbol."""
-    params = {"category": "linear", "symbol": symbol}
-    resp = _http_get(f"{BYBIT_REST}/v5/market/funding/history", params=params)
+def bybit_get_funding_rates_batch(symbols: List[str]) -> Dict[str, Dict]:
+    """Get funding rates for multiple symbols in batches."""
+    funding_data = {}
     
-    if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
-        return resp["result"]["list"][0]
-    return {}
-
-def bybit_get_ticker(symbol: str) -> Dict:
-    """Get ticker information for a symbol."""
-    params = {"category": "linear", "symbol": symbol}
-    resp = _http_get(f"{BYBIT_REST}/v5/market/tickers", params=params)
+    # Bybit API supports up to 10 symbols per request for funding rate
+    batch_size = 10
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i + batch_size]
+        
+        # Get funding rates for all symbols in batch
+        params = {"category": "linear", "symbol": ",".join(batch)}
+        try:
+            resp = _http_get(f"{BYBIT_REST}/v5/market/funding/history", params=params)
+            
+            if "result" in resp and "list" in resp["result"]:
+                for item in resp["result"]["list"]:
+                    symbol = item.get("symbol")
+                    if symbol:
+                        funding_data[symbol] = item
+        except Exception as e:
+            print(f"Error fetching funding rates for batch: {e}")
+        
+        time.sleep(0.2)  # Rate limiting between batches
     
-    if "result" in resp and "list" in resp["result"] and resp["result"]["list"]:
-        return resp["result"]["list"][0]
-    return {}
+    return funding_data
 
-def coingecko_get_market_data(symbol_id: str) -> Dict:
-    """Get market data from CoinGecko for a coin."""
+def bybit_get_tickers_batch(symbols: List[str]) -> Dict[str, Dict]:
+    """Get ticker data for multiple symbols in batches."""
+    ticker_data = {}
+    
+    # Bybit API supports up to 10 symbols per request for tickers
+    batch_size = 10
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i + batch_size]
+        
+        params = {"category": "linear", "symbol": ",".join(batch)}
+        try:
+            resp = _http_get(f"{BYBIT_REST}/v5/market/tickers", params=params)
+            
+            if "result" in resp and "list" in resp["result"]:
+                for item in resp["result"]["list"]:
+                    symbol = item.get("symbol")
+                    if symbol:
+                        ticker_data[symbol] = item
+        except Exception as e:
+            print(f"Error fetching tickers for batch: {e}")
+        
+        time.sleep(0.2)  # Rate limiting between batches
+    
+    return ticker_data
+
+def coingecko_get_market_data_batch(symbols: Set[str]) -> Dict[str, Dict]:
+    """Get market data from CoinGecko for multiple symbols in minimal requests."""
+    print(f"Fetching CoinGecko data for {len(symbols)} unique symbols...")
+    
     try:
-        # First get the coin ID from symbol
+        # Get all coins list once
         coins_list = _http_get(f"{COINGECKO_REST}/coins/list")
+        print(f"Retrieved {len(coins_list)} coins from CoinGecko")
         
-        coin_id = None
+        # Map symbols to coin IDs
+        symbol_to_id = {}
         for coin in coins_list:
-            if coin["symbol"].lower() == symbol_id.lower():
-                coin_id = coin["id"]
-                break
+            symbol = coin["symbol"].lower()
+            if symbol in symbols:
+                symbol_to_id[symbol] = coin["id"]
         
-        if not coin_id:
-            return {}
+        print(f"Found {len(symbol_to_id)} symbols in CoinGecko")
         
-        # Get market data
-        params = {
-            "ids": coin_id,
-            "vs_currency": "usd",
-            "sparkline": "false"
-        }
-        data = _http_get(f"{COINGECKO_REST}/coins/markets", params=params)
+        # Batch by 30 coin IDs per request (CoinGecko limit)
+        coin_ids = list(symbol_to_id.values())
+        market_data = {}
         
-        if data:
-            return data[0]
-        return {}
+        batch_size = 30  # CoinGecko's limit per request
+        for i in range(0, len(coin_ids), batch_size):
+            batch_ids = coin_ids[i:i + batch_size]
+            
+            params = {
+                "ids": ",".join(batch_ids),
+                "vs_currency": "usd",
+                "sparkline": "false"
+            }
+            
+            try:
+                data = _http_get(f"{COINGECKO_REST}/coins/markets", params=params)
+                
+                for coin_data in data:
+                    coin_id = coin_data.get("id")
+                    # Find which symbol this coin_id corresponds to
+                    for symbol, cid in symbol_to_id.items():
+                        if cid == coin_id:
+                            market_data[symbol] = coin_data
+                            break
+                
+                print(f"Processed batch {i//batch_size + 1}/{(len(coin_ids)-1)//batch_size + 1}")
+                
+                # Rate limiting for CoinGecko (max 10-30 calls per minute)
+                if i + batch_size < len(coin_ids):
+                    time.sleep(6)  # Wait 6 seconds between batches
+                    
+            except Exception as e:
+                print(f"Error fetching CoinGecko batch: {e}")
+                continue
+        
+        return market_data
         
     except Exception as e:
-        print(f"Error getting CoinGecko data for {symbol_id}: {e}")
+        print(f"Error getting CoinGecko data: {e}")
         return {}
-
-def format_number(num: float) -> str:
-    """Format number with commas."""
-    try:
-        return f"{num:,.6f}".rstrip('0').rstrip('.')
-    except (ValueError, TypeError):
-        return str(num)
 
 def main():
     parser = argparse.ArgumentParser(description="Track negative funding rates on Bybit")
@@ -122,54 +177,82 @@ def main():
                        help="Number of top negative funding rates to show")
     parser.add_argument("--skip-market-cap", action="store_true",
                        help="Skip market cap filtering (show all symbols)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                       help="Show verbose output")
     args = parser.parse_args()
 
-    print(f"UTC {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')} | min_cap={args.min_cap:,.0f} USD | fetching...")
+    print(f"UTC {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')} | min_cap={args.min_cap:,.0f} USD")
+    print("=" * 80)
     
-    # Get all linear instruments
+    # Step 1: Get all linear instruments
+    print("Fetching all linear instruments from Bybit...")
     instruments = bybit_get_all_linear_instruments()
     print(f"Found {len(instruments)} linear instruments")
     
+    # Filter for USDT pairs
+    usdt_instruments = [instr for instr in instruments if instr.get("symbol", "").endswith("USDT")]
+    print(f"Filtered to {len(usdt_instruments)} USDT pairs")
+    
+    # Step 2: Get funding rates for all USDT pairs in batches
+    symbols = [instr["symbol"] for instr in usdt_instruments]
+    print(f"Fetching funding rates for {len(symbols)} symbols...")
+    funding_data = bybit_get_funding_rates_batch(symbols)
+    print(f"Retrieved funding rates for {len(funding_data)} symbols")
+    
+    # Step 3: Filter for negative funding rates
+    negative_symbols = []
+    for symbol, data in funding_data.items():
+        funding_rate = float(data.get("fundingRate", 0))
+        if funding_rate < 0:  # Negative funding
+            negative_symbols.append(symbol)
+    
+    print(f"Found {len(negative_symbols)} symbols with negative funding rates")
+    
+    if not negative_symbols:
+        print("No negative funding rates found!")
+        return
+    
+    # Step 4: Get ticker data for negative symbols in batches
+    print(f"Fetching ticker data for {len(negative_symbols)} symbols...")
+    ticker_data = bybit_get_tickers_batch(negative_symbols)
+    
+    # Step 5: Get CoinGecko data for unique base coins
+    base_coins = set()
+    symbol_to_base = {}
+    for symbol in negative_symbols:
+        # Extract base coin (remove 'USDT')
+        base_coin = symbol[:-4].upper()
+        base_coins.add(base_coin.lower())  # CoinGecko uses lowercase
+        symbol_to_base[symbol] = base_coin
+    
+    # Step 6: Get market cap data from CoinGecko (if not skipping)
+    market_cap_data = {}
+    if not args.skip_market_cap:
+        market_cap_data = coingecko_get_market_data_batch(base_coins)
+        print(f"Retrieved market cap data for {len(market_cap_data)} symbols")
+    else:
+        print("Skipping market cap filtering as requested")
+    
+    # Step 7: Process and compile results
     results = []
     
-    for i, instr in enumerate(instruments):
-        symbol = instr.get("symbol", "")
-        base_coin = instr.get("baseCoin", "")
+    for symbol in negative_symbols:
+        base_coin = symbol_to_base[symbol]
+        funding_info = funding_data.get(symbol, {})
+        ticker_info = ticker_data.get(symbol, {})
         
-        if not symbol.endswith("USDT"):
-            continue
+        funding_rate = float(funding_info.get("fundingRate", 0))
+        mark_price = float(ticker_info.get("markPrice", 0))
+        turnover24h = float(ticker_info.get("turnover24h", 0))
+        next_funding_time = funding_info.get("fundingRateTimestamp", "")
         
-        print(f"Processing {i+1}/{len(instruments)}: {symbol}...")
-        
-        # Get funding rate
-        funding_data = bybit_get_funding_rate(symbol)
-        if not funding_data:
-            continue
-            
-        funding_rate = float(funding_data.get("fundingRate", 0))
-        
-        # Skip positive or zero funding rates
-        if funding_rate >= 0:
-            continue
-        
-        # Get ticker data
-        ticker = bybit_get_ticker(symbol)
-        if not ticker:
-            continue
-            
-        mark_price = float(ticker.get("markPrice", 0))
-        turnover24h = float(ticker.get("turnover24h", 0))
-        next_funding_time = funding_data.get("fundingRateTimestamp", "")
-        
-        # Initialize market cap
+        # Get market cap
         market_cap = 0
-        
-        # Get market cap from CoinGecko if not skipping
         if not args.skip_market_cap:
-            market_data = coingecko_get_market_data(base_coin)
-            market_cap = market_data.get("market_cap", 0) or 0
+            coin_data = market_cap_data.get(base_coin.lower(), {})
+            market_cap = coin_data.get("market_cap", 0) or 0
             
-            # Apply market cap filter (only if we have valid data)
+            # Apply market cap filter
             if market_cap and market_cap < args.min_cap:
                 continue
         else:
@@ -185,30 +268,47 @@ def main():
             "markPrice": mark_price,
             "turnover24h": turnover24h
         })
-        
-        # Rate limiting
-        time.sleep(0.1)
     
-    # Sort by most negative funding rate
+    # Step 8: Sort by most negative funding rate
     results.sort(key=lambda x: x["fundingRate"])
     
     # Take top N results
     results = results[:args.top]
     
+    # Step 9: Display results
+    print("\n" + "=" * 120)
+    print(f"TOP {len(results)} NEGATIVE FUNDING RATES")
+    print("=" * 120)
+    
     # Print header
-    print(f"\n{'symbol':<12} {'base':<8} {'fundingRate':<12} {'marketCapUSD':<20} {'nextFundingTime':<25} {'markPrice':<12} {'turnover24h':<15}")
+    print(f"{'#':<3} {'symbol':<12} {'base':<8} {'fundingRate':<12} {'marketCapUSD':<20} {'nextFundingTime':<25} {'markPrice':<12} {'turnover24h':<15}")
     print("-" * 120)
     
     # Print data
-    for r in results:
-        market_cap_display = "N/A" if r['marketCapUSD'] == float('inf') else f"{r['marketCapUSD']:,.0f}"
-        print(f"{r['symbol']:<12} {r['base']:<8} "
-              f"{r['fundingRate']:<12.6f} "
+    for idx, r in enumerate(results, 1):
+        if r['marketCapUSD'] == float('inf'):
+            market_cap_display = "N/A"
+        elif r['marketCapUSD'] == 0:
+            market_cap_display = "Not Found"
+        else:
+            market_cap_display = f"${r['marketCapUSD']:,.0f}"
+        
+        funding_rate_display = f"{r['fundingRate']:.6f}"
+        if r['fundingRate'] < -0.001:
+            funding_rate_display = f"\033[91m{funding_rate_display}\033[0m"  # Red for very negative
+        
+        print(f"{idx:<3} {r['symbol']:<12} {r['base']:<8} "
+              f"{funding_rate_display:<12} "
               f"{market_cap_display:<20} "
               f"{r['nextFundingTime']:<25} "
               f"{r['markPrice']:<12.6f} "
               f"{r['turnover24h']:<15.6f}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nScript interrupted by user")
+    except Exception as e:
+        print(f"\nError: {e}")
 
