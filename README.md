@@ -1,7 +1,7 @@
 # Funding Tracker
 
 What this script does:
-This is a Python script that tracks negative funding rates on Bybit exchange for perpetual futures contracts. It:
+This is a Python script that tracks funding rates on Bybit exchange for perpetual futures contracts. It:
 
 - Fetches all linear (perpetual) trading pairs from Bybit
 
@@ -9,7 +9,7 @@ This is a Python script that tracks negative funding rates on Bybit exchange for
 
 - Filters for assets with market cap > $100M
 
-- Sorts by most negative funding rates
+- Sorts by most negative and positive funding rates
 
 - Displays results in a formatted table
 
@@ -43,15 +43,17 @@ This is a Python script that tracks negative funding rates on Bybit exchange for
 
 ![Image of Minecraft comes alive](https://github.com/Yuki-Ryu/funding_tracker/blob/main/Example.png)
 
-## Notable negative rates in your output:
+## Notable negative and positive rates in your output:
 
-    OG USDT : -0.002507 % (quite negative)
+    SYMBOL      NAME            FUNDING
+    
+    AIOZUSDT    AIOZ Network    0.000100  % (quite positive)
+    ARUSDT      Arweave         0.000100  %
+    
+    
+    OGUSDT      OG              -0.010000 % (quite negative)
+    2ZUSDT      DoubleZero      -0.002540 %
 
-    PIPPIN USDT : -0.001290 %
-
-    BEAT USDT : -0.000807 %
-
-    IP USDT : -0.000017 %
 
 
 
@@ -78,24 +80,47 @@ This is a Python script that tracks negative funding rates on Bybit exchange for
 - Includes error handling and timeout settings
 
 
-# To use this script:
+> [!NOTE]
+> # What has changed:
+
+## Resolved the 429 Error:
+
+- The script no longer calls CoinGecko in a loop for every coin.
+
+- It uses the /coins/markets endpoint with the ids parameter, which allows querying up to 250 coins in a single request.
+
+## Dual Funding Monitoring:
+
+- The script now sorts and displays two separate tables: Highest Positive Funding (Longs pay Shorts) and Most Negative Funding (Shorts pay Longs).
+
+## Performance Optimization:
+
+- It fetches all Bybit tickers in one call (/v5/market/tickers) instead of querying individual funding histories, making the script run significantly faster.
+
+## Resilience:
+
+- Added a retry mechanism: if you do hit a rate limit, the script will wait and try again automatically rather than crashing.
+
+
+> [!IMPORTANT]
+> #To use this script:
 
 - Solution 1: Run Python Directly (Easiest)
 Simply run the script with Python directly:
 
 powershell
 
-    python bybit_negative_funding_tracker.py
+    python bybit_multi_funding_tracker.py
 Or if that doesn't work:
 
 powershell
 
-    python3 bybit_negative_funding_tracker.py
+    python3 bybit_multi_funding_tracker.py
 Or:
 
 powershell
 
-    py bybit_negative_funding_tracker.py
+    py bybit_multi_funding_tracker.py
 
 
 - Solution 2: Run a Batch File called run_funding_tracker.bat in the same folder:
@@ -103,7 +128,7 @@ powershell
 batch
   
     @echo off
-    python bybit_negative_funding_tracker.py %*
+    python bybit_multi_funding_tracker.py --top 20 --min-cap 100000000 %*
     pause
 Then double-click the .bat file to run.
 
